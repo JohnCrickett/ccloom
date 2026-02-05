@@ -438,7 +438,9 @@ function App() {
     recordedChunksRef.current = []
 
     // Check if at least one source is enabled
-    const hasVideoSource = isCameraEnabled || isScreenEnabled
+    // Screen recording requires both the toggle AND an active stream
+    const hasScreenSource = isScreenEnabled && screenStream
+    const hasVideoSource = isCameraEnabled || hasScreenSource
     const hasAudioSource = isMicEnabled
 
     if (!hasVideoSource && !hasAudioSource) {
