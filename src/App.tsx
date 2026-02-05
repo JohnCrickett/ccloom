@@ -5,6 +5,7 @@ const MIC_STORAGE_KEY = 'loom-clone-selected-mic'
 const CAMERA_STORAGE_KEY = 'loom-clone-selected-camera'
 const MIC_ENABLED_KEY = 'loom-clone-mic-enabled'
 const CAMERA_ENABLED_KEY = 'loom-clone-camera-enabled'
+const SCREEN_ENABLED_KEY = 'loom-clone-screen-enabled'
 
 // Check File System Access API support at module level
 const isApiSupported = typeof window !== 'undefined' && 'showDirectoryPicker' in window
@@ -49,6 +50,11 @@ function App() {
     const saved = localStorage.getItem(CAMERA_ENABLED_KEY)
     return saved === null ? true : saved === 'true'
   })
+  const [isScreenEnabled, setIsScreenEnabled] = useState<boolean>(() => {
+    const saved = localStorage.getItem(SCREEN_ENABLED_KEY)
+    return saved === null ? false : saved === 'true'
+  })
+  const [screenStream, setScreenStream] = useState<MediaStream | null>(null)
 
   // Recording state
   const [isRecording, setIsRecording] = useState(false)
@@ -170,6 +176,45 @@ function App() {
     localStorage.setItem(CAMERA_ENABLED_KEY, String(newState))
   }
 
+  // Handle screen toggle - request screen capture when enabled
+  const handleToggleScreen = async () => {
+    if (isScreenEnabled) {
+      // Turning off - stop the screen stream
+      if (screenStream) {
+        screenStream.getTracks().forEach(track => track.stop())
+        setScreenStream(null)
+      }
+      setIsScreenEnabled(false)
+      localStorage.setItem(SCREEN_ENABLED_KEY, 'false')
+    } else {
+      // Turning on - request screen capture
+      try {
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: false
+        })
+
+        // Handle user stopping screen share from browser UI
+        stream.getVideoTracks()[0].onended = () => {
+          setScreenStream(null)
+          setIsScreenEnabled(false)
+          localStorage.setItem(SCREEN_ENABLED_KEY, 'false')
+        }
+
+        setScreenStream(stream)
+        setIsScreenEnabled(true)
+        localStorage.setItem(SCREEN_ENABLED_KEY, 'true')
+      } catch (err) {
+        // User cancelled screen selection - don't show error, just keep disabled
+        if (err instanceof Error && err.name !== 'NotAllowedError') {
+          setRecordingError(`Failed to capture screen: ${err.message}`)
+        }
+        setIsScreenEnabled(false)
+        localStorage.setItem(SCREEN_ENABLED_KEY, 'false')
+      }
+    }
+  }
+
   // Format duration as MM:SS
   const formatDuration = (seconds: number): string => {
     const mins = Math.floor(seconds / 60)
@@ -227,31 +272,58 @@ function App() {
     setSaveSuccess(null)
     recordedChunksRef.current = []
 
-    // Build media constraints
-    const constraints: MediaStreamConstraints = {}
+    // Check if at least one source is enabled
+    const hasVideoSource = isCameraEnabled || isScreenEnabled
+    const hasAudioSource = isMicEnabled
 
-    if (isMicEnabled && selectedMicId) {
-      constraints.audio = { deviceId: { exact: selectedMicId } }
-    } else if (isMicEnabled) {
-      constraints.audio = true
+    if (!hasVideoSource && !hasAudioSource) {
+      setRecordingError('Please enable at least the microphone, camera, or screen recording.')
+      return
     }
 
-    if (isCameraEnabled && selectedCameraId) {
-      constraints.video = { deviceId: { exact: selectedCameraId } }
-    } else if (isCameraEnabled) {
-      constraints.video = true
-    }
-
-    // Ensure at least one input is enabled
-    if (!constraints.audio && !constraints.video) {
-      setRecordingError('Please enable at least the microphone or camera to record.')
+    // Check screen stream is available if screen is enabled
+    if (isScreenEnabled && !screenStream) {
+      setRecordingError('Screen stream not available. Please re-enable screen recording.')
       return
     }
 
     try {
-      // Get media stream
-      const stream = await navigator.mediaDevices.getUserMedia(constraints)
-      mediaStreamRef.current = stream
+      // Build combined stream
+      const tracks: MediaStreamTrack[] = []
+
+      // Add screen video track if enabled (prioritize screen over camera for video)
+      if (isScreenEnabled && screenStream) {
+        const screenVideoTrack = screenStream.getVideoTracks()[0]
+        if (screenVideoTrack) {
+          tracks.push(screenVideoTrack)
+        }
+      } else if (isCameraEnabled) {
+        // Only use camera if screen is not enabled
+        const cameraConstraints: MediaStreamConstraints = {
+          video: selectedCameraId ? { deviceId: { exact: selectedCameraId } } : true
+        }
+        const cameraStream = await navigator.mediaDevices.getUserMedia(cameraConstraints)
+        const cameraVideoTrack = cameraStream.getVideoTracks()[0]
+        if (cameraVideoTrack) {
+          tracks.push(cameraVideoTrack)
+        }
+      }
+
+      // Add microphone audio track if enabled
+      if (isMicEnabled) {
+        const audioConstraints: MediaStreamConstraints = {
+          audio: selectedMicId ? { deviceId: { exact: selectedMicId } } : true
+        }
+        const audioStream = await navigator.mediaDevices.getUserMedia(audioConstraints)
+        const audioTrack = audioStream.getAudioTracks()[0]
+        if (audioTrack) {
+          tracks.push(audioTrack)
+        }
+      }
+
+      // Create combined stream from all tracks
+      const combinedStream = new MediaStream(tracks)
+      mediaStreamRef.current = combinedStream
 
       // Determine supported mimeType
       let mimeType = 'video/webm;codecs=vp9'
@@ -267,7 +339,7 @@ function App() {
 
       // Create MediaRecorder
       const options: MediaRecorderOptions = mimeType ? { mimeType } : {}
-      const mediaRecorder = new MediaRecorder(stream, options)
+      const mediaRecorder = new MediaRecorder(combinedStream, options)
       mediaRecorderRef.current = mediaRecorder
 
       // Handle data available
@@ -285,9 +357,14 @@ function App() {
           recordingTimerRef.current = null
         }
 
-        // Stop all tracks
+        // Stop all tracks in the recording stream (except screen tracks which are managed separately)
         if (mediaStreamRef.current) {
-          mediaStreamRef.current.getTracks().forEach(track => track.stop())
+          mediaStreamRef.current.getTracks().forEach(track => {
+            // Don't stop screen tracks here - they're managed by handleToggleScreen
+            if (!screenStream || !screenStream.getTracks().includes(track)) {
+              track.stop()
+            }
+          })
           mediaStreamRef.current = null
         }
 
@@ -351,8 +428,11 @@ function App() {
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach(track => track.stop())
       }
+      if (screenStream) {
+        screenStream.getTracks().forEach(track => track.stop())
+      }
     }
-  }, [])
+  }, [screenStream])
 
   const handleSelectFolder = async () => {
     if (!isApiSupported) return
@@ -570,6 +650,45 @@ function App() {
                     </button>
                   </div>
                 </div>
+
+                {/* Screen Recording */}
+                <div className="mt-6 text-left">
+                  <label className="text-purple-300 text-sm mb-2 block">
+                    <span className="flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                      </svg>
+                      Screen Recording
+                    </span>
+                  </label>
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1 bg-purple-900/50 border border-purple-500/30 rounded-lg px-4 py-3 text-white">
+                      {isScreenEnabled && screenStream ? (
+                        <span className="text-green-400 flex items-center gap-2">
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                          </svg>
+                          Screen capture active
+                        </span>
+                      ) : (
+                        <span className="text-purple-400">No screen selected</span>
+                      )}
+                    </div>
+                    <button
+                      onClick={handleToggleScreen}
+                      disabled={isRecording}
+                      className={`flex items-center gap-2 px-4 py-3 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                        isScreenEnabled && screenStream
+                          ? 'bg-green-500/20 border border-green-500/50 text-green-400 hover:bg-green-500/30'
+                          : 'bg-red-500/20 border border-red-500/50 text-red-400 hover:bg-red-500/30'
+                      }`}
+                      title={isScreenEnabled ? 'Disable screen recording' : 'Enable screen recording'}
+                    >
+                      <span className="text-lg">{isScreenEnabled && screenStream ? '🖥️' : '⬛'}</span>
+                      <span className="text-sm">{isScreenEnabled && screenStream ? 'Enabled' : 'Disabled'}</span>
+                    </button>
+                  </div>
+                </div>
               </>
             )}
           </div>
@@ -615,9 +734,9 @@ function App() {
             {!isRecording ? (
               <button
                 onClick={handleStartRecording}
-                disabled={!folderHandle || (!isMicEnabled && !isCameraEnabled)}
+                disabled={!folderHandle || (!isMicEnabled && !isCameraEnabled && !(isScreenEnabled && screenStream))}
                 className="bg-red-500 hover:bg-red-600 disabled:bg-gray-500 disabled:cursor-not-allowed text-white font-semibold py-4 px-8 rounded-lg transition-colors duration-200 text-lg flex items-center gap-2"
-                title={!folderHandle ? 'Please select a folder first' : (!isMicEnabled && !isCameraEnabled) ? 'Enable at least microphone or camera' : 'Start recording'}
+                title={!folderHandle ? 'Please select a folder first' : (!isMicEnabled && !isCameraEnabled && !(isScreenEnabled && screenStream)) ? 'Enable at least microphone, camera, or screen' : 'Start recording'}
               >
                 <span className="w-3 h-3 bg-white rounded-full" />
                 Start Recording
