@@ -16,6 +16,13 @@ interface MediaDeviceInfo {
   kind: MediaDeviceKind
 }
 
+interface RecordingMetadata {
+  filename: string
+  timestamp: Date
+  size: number
+  fileHandle: FileSystemFileHandle
+}
+
 function App() {
   // Initialize folder path from localStorage
   const [folderPath, setFolderPath] = useState<string | null>(() => {
@@ -61,6 +68,13 @@ function App() {
   const [recordingError, setRecordingError] = useState<string | null>(null)
   const [recordingDuration, setRecordingDuration] = useState(0)
   const [saveSuccess, setSaveSuccess] = useState<string | null>(null)
+
+  // Recordings list state
+  const [recordings, setRecordings] = useState<RecordingMetadata[]>([])
+  const [selectedRecording, setSelectedRecording] = useState<RecordingMetadata | null>(null)
+  const [isLoadingRecordings, setIsLoadingRecordings] = useState(false)
+  const [playbackUrl, setPlaybackUrl] = useState<string | null>(null)
+  const [playbackError, setPlaybackError] = useState<string | null>(null)
 
   // Refs for recording
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
@@ -150,6 +164,81 @@ function App() {
     detectDevices()
   }, [])
 
+  // Load recordings from the selected folder
+  const loadRecordings = useCallback(async () => {
+    if (!folderHandle) {
+      setRecordings([])
+      return
+    }
+
+    setIsLoadingRecordings(true)
+    setPlaybackError(null)
+
+    try {
+      const recordingsList: RecordingMetadata[] = []
+
+      // Iterate through files in the folder
+      for await (const entry of folderHandle.values()) {
+        if (entry.kind === 'file' && entry.name.endsWith('.webm')) {
+          try {
+            // Cast to FileSystemFileHandle since we checked entry.kind === 'file'
+            const fileHandle = entry as FileSystemFileHandle
+            const file = await fileHandle.getFile()
+
+            // Extract timestamp from filename: recording-YYYY-MM-DD-HH-MM-SS.webm
+            const match = entry.name.match(/recording-(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})\.webm/)
+            let timestamp: Date
+            if (match) {
+              const [, year, month, day, hour, min, sec] = match
+              timestamp = new Date(
+                parseInt(year),
+                parseInt(month) - 1,
+                parseInt(day),
+                parseInt(hour),
+                parseInt(min),
+                parseInt(sec)
+              )
+            } else {
+              // Fallback to file modification time
+              timestamp = new Date(file.lastModified)
+            }
+
+            recordingsList.push({
+              filename: entry.name,
+              timestamp,
+              size: file.size,
+              fileHandle: fileHandle
+            })
+          } catch {
+            // Skip files that can't be read
+            console.warn(`Could not read file: ${entry.name}`)
+          }
+        }
+      }
+
+      // Sort by timestamp (newest first)
+      recordingsList.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
+      setRecordings(recordingsList)
+
+    } catch (err) {
+      if (err instanceof Error) {
+        if (err.name === 'NotAllowedError') {
+          setPlaybackError('Folder access was revoked. Please re-select the folder.')
+        } else {
+          setPlaybackError(`Failed to load recordings: ${err.message}`)
+        }
+      }
+      setRecordings([])
+    } finally {
+      setIsLoadingRecordings(false)
+    }
+  }, [folderHandle])
+
+  // Load recordings when folder handle changes
+  useEffect(() => {
+    loadRecordings()
+  }, [loadRecordings])
+
   // Handle microphone selection
   const handleMicChange = (deviceId: string) => {
     setSelectedMicId(deviceId)
@@ -222,6 +311,80 @@ function App() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
   }
 
+  // Format file size for display
+  const formatFileSize = (bytes: number): string => {
+    if (bytes < 1024) return `${bytes} B`
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  }
+
+  // Format date for display
+  const formatRecordingDate = (date: Date): string => {
+    return date.toLocaleDateString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    })
+  }
+
+  // Handle playing a recording
+  const handlePlayRecording = async (recording: RecordingMetadata) => {
+    // Clean up previous playback URL if exists
+    if (playbackUrl) {
+      URL.revokeObjectURL(playbackUrl)
+      setPlaybackUrl(null)
+    }
+    setPlaybackError(null)
+
+    try {
+      const file = await recording.fileHandle.getFile()
+      const url = URL.createObjectURL(file)
+      setPlaybackUrl(url)
+      setSelectedRecording(recording)
+    } catch (err) {
+      if (err instanceof Error) {
+        if (err.name === 'NotAllowedError') {
+          setPlaybackError('File access was revoked. Please re-select the folder.')
+        } else {
+          setPlaybackError(`Failed to load recording: ${err.message}`)
+        }
+      }
+    }
+  }
+
+  // Handle closing the video player
+  const handleClosePlayer = () => {
+    if (playbackUrl) {
+      URL.revokeObjectURL(playbackUrl)
+      setPlaybackUrl(null)
+    }
+    setSelectedRecording(null)
+    setPlaybackError(null)
+  }
+
+  // Handle deleting a recording
+  const handleDeleteRecording = async (recording: RecordingMetadata, e: React.MouseEvent) => {
+    e.stopPropagation() // Prevent triggering play
+
+    if (!confirm(`Delete "${recording.filename}"?`)) return
+
+    try {
+      await folderHandle?.removeEntry(recording.filename)
+      // Close player if this recording was playing
+      if (selectedRecording?.filename === recording.filename) {
+        handleClosePlayer()
+      }
+      // Refresh list
+      await loadRecordings()
+    } catch (err) {
+      if (err instanceof Error) {
+        setPlaybackError(`Failed to delete recording: ${err.message}`)
+      }
+    }
+  }
+
   // Generate filename with timestamp
   const generateFilename = (): string => {
     const now = new Date()
@@ -245,6 +408,8 @@ function App() {
         await writable.close()
         setSaveSuccess(`Recording saved: ${filename}`)
         setTimeout(() => setSaveSuccess(null), 5000)
+        // Refresh recordings list
+        await loadRecordings()
         return
       } catch (err) {
         console.error('File System Access API save failed:', err)
@@ -263,7 +428,7 @@ function App() {
     URL.revokeObjectURL(url)
     setSaveSuccess(`Recording downloaded: ${filename}`)
     setTimeout(() => setSaveSuccess(null), 5000)
-  }, [folderHandle])
+  }, [folderHandle, loadRecordings])
 
   // Start recording
   const handleStartRecording = async () => {
@@ -433,6 +598,15 @@ function App() {
       }
     }
   }, [screenStream])
+
+  // Cleanup playback URL on unmount
+  useEffect(() => {
+    return () => {
+      if (playbackUrl) {
+        URL.revokeObjectURL(playbackUrl)
+      }
+    }
+  }, [playbackUrl])
 
   const handleSelectFolder = async () => {
     if (!isApiSupported) return
@@ -753,11 +927,6 @@ function App() {
               </button>
             )}
 
-            {!isRecording && folderPath && folderHandle && (
-              <button className="bg-transparent border-2 border-purple-400 hover:bg-purple-800 text-white font-semibold py-4 px-6 rounded-lg transition-colors duration-200">
-                View Library
-              </button>
-            )}
           </div>
 
           {/* Helper text when no folder selected */}
@@ -766,8 +935,126 @@ function App() {
               Select a folder above to start recording
             </p>
           )}
+
+          {/* Recordings List */}
+          {folderHandle && !isRecording && (
+            <div className="bg-white/10 backdrop-blur-sm rounded-xl p-6 mt-8 w-full">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-xl font-semibold text-white flex items-center gap-2">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                  </svg>
+                  Recordings
+                </h3>
+                <button
+                  onClick={() => loadRecordings()}
+                  disabled={isLoadingRecordings}
+                  className="text-purple-300 hover:text-white transition-colors flex items-center gap-1 text-sm disabled:opacity-50"
+                  title="Refresh recordings list"
+                >
+                  <svg className={`w-4 h-4 ${isLoadingRecordings ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  Refresh
+                </button>
+              </div>
+
+              {/* Playback Error */}
+              {playbackError && (
+                <div className="bg-red-500/20 border border-red-500/50 rounded-lg px-4 py-3 mb-4">
+                  <p className="text-red-200">{playbackError}</p>
+                </div>
+              )}
+
+              {isLoadingRecordings ? (
+                <div className="text-center py-8">
+                  <div className="inline-block w-8 h-8 border-4 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                  <p className="text-purple-300 mt-2">Loading recordings...</p>
+                </div>
+              ) : recordings.length === 0 ? (
+                <div className="text-center py-8">
+                  <svg className="w-12 h-12 text-purple-400 mx-auto mb-3 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                  <p className="text-purple-300">No recordings yet</p>
+                  <p className="text-purple-400 text-sm mt-1">Start recording to see your videos here</p>
+                </div>
+              ) : (
+                <div className="space-y-3 max-h-64 overflow-y-auto">
+                  {recordings.map((recording) => (
+                    <div
+                      key={recording.filename}
+                      onClick={() => handlePlayRecording(recording)}
+                      className="bg-purple-900/50 hover:bg-purple-800/50 rounded-lg px-4 py-3 flex items-center justify-between cursor-pointer transition-colors group"
+                    >
+                      <div className="flex items-center gap-3 flex-1 min-w-0">
+                        <div className="w-10 h-10 bg-purple-500/30 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:bg-purple-500/50 transition-colors">
+                          <svg className="w-5 h-5 text-purple-200" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M8 5v14l11-7z" />
+                          </svg>
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-white font-medium truncate">{formatRecordingDate(recording.timestamp)}</p>
+                          <p className="text-purple-400 text-sm">{formatFileSize(recording.size)}</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 ml-4">
+                        <button
+                          onClick={(e) => handleDeleteRecording(recording, e)}
+                          className="text-purple-400 hover:text-red-400 transition-colors p-2 rounded-lg hover:bg-red-500/20"
+                          title="Delete recording"
+                        >
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </main>
+
+      {/* Video Player Modal */}
+      {selectedRecording && playbackUrl && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex flex-col">
+          {/* Header */}
+          <div className="flex items-center justify-between p-4 border-b border-white/10">
+            <div className="flex items-center gap-3">
+              <svg className="w-6 h-6 text-purple-400" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M8 5v14l11-7z" />
+              </svg>
+              <div>
+                <p className="text-white font-medium">{formatRecordingDate(selectedRecording.timestamp)}</p>
+                <p className="text-purple-400 text-sm">{selectedRecording.filename}</p>
+              </div>
+            </div>
+            <button
+              onClick={handleClosePlayer}
+              className="text-white hover:text-red-400 transition-colors p-2 rounded-lg hover:bg-white/10"
+              title="Close player"
+            >
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          {/* Video Player */}
+          <div className="flex-1 flex items-center justify-center p-4">
+            <video
+              src={playbackUrl}
+              controls
+              autoPlay
+              className="max-w-full max-h-full rounded-lg shadow-2xl"
+              onError={() => setPlaybackError('Failed to play this recording. The file may be corrupted.')}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Footer */}
       <footer className="p-6 text-center">
